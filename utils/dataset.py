@@ -1,8 +1,12 @@
+import argparse
+from pathlib import Path
+
 import torch
-from torch.utils.data import Dataset
 import numpy as np
 import cv2 as cv
-from pathlib import Path
+
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset
 
 
 class SIMDataset(Dataset):
@@ -25,7 +29,7 @@ class SIMDataset(Dataset):
 
         self.is_train = True if self.mask_dir else False
 
-        # Validate data only if we are in training mode (have masks)
+        # Validate data only if we are in training mode
         if self.is_train:
             self._validate_data()
 
@@ -37,81 +41,39 @@ class SIMDataset(Dataset):
         image_bgr = cv.imread(str(self.images[idx]))
         image_rgb = cv.cvtColor(image_bgr, cv.COLOR_BGR2RGB)
 
-        # 2. Generate Noise Stream
-        # We pass the RGB image, but the helper calculates the intensity sum internally
-        image_noise = self._apply_srm(image_rgb)
+        target_size = (512, 512)
 
-        # 3. Load Mask
+        # Resize Image
+        image_rgb = cv.resize(
+            image_rgb, dsize=target_size, interpolation=cv.INTER_CUBIC
+        )  # (512, 512, 3)
+
+        # 2. Load Mask
         if self.is_train:
-            mask = np.load(str(self.masks[idx]))
-            mask = torch.from_numpy(mask).float()  # Ensure float for loss functions
+            mask = np.load(str(self.masks[idx]))  # (C, H, W)
+
+            # A. Collapse channels
+            if mask.ndim == 3:
+                mask = np.max(mask, axis=0)  # (H, W)
+
+            # B. Resize Mask
+            mask = cv.resize(
+                mask, dsize=target_size, interpolation=cv.INTER_NEAREST
+            )  # (512, 512)
+
+            # C. Add channel dimension back: (512, 512) -> (512, 512, 1)
+            mask = np.expand_dims(mask, axis=-1)
+
+            # D. To Tensor (512, 512, 1) -> (1, 512, 512)
+            mask = torch.from_numpy(mask).permute(2, 0, 1).float()
         else:
-            # Return a dummy mask or handle differently for inference
-            mask = torch.zeros((image_rgb.shape[0], image_rgb.shape[1]))
+            # Return dummy mask for inference
+            mask = torch.zeros((1, target_size[1], target_size[0]))
 
-        # 4. To Tensor
-        # PyTorch expects (C, H, W), OpenCV gives (H, W, C).
+        # 3. To Tensor (512, 512, 3) -> (3, 512, 512)
         image_rgb = torch.from_numpy(image_rgb).permute(2, 0, 1).float() / 255.0
-        image_noise = torch.from_numpy(image_noise).permute(2, 0, 1).float()
 
-        return image_rgb, image_noise, mask
-
-    def _apply_srm(self, image: np.ndarray):
-        """Apply the three SRM kernels to the image."""
-
-        # Kernel 1
-        k1 = np.array(
-            [
-                [0, 0, 0, 0, 0],
-                [0, -1, 2, -1, 0],
-                [0, 2, -4, 2, 0],
-                [0, -1, 2, -1, 0],
-                [0, 0, 0, 0, 0],
-            ],
-            dtype=np.float32,
-        )
-        k1 = k1 / 4.0
-
-        # Kernel 2
-        k2 = np.array(
-            [
-                [-1, 2, -2, 2, -1],
-                [2, -6, 8, -6, 2],
-                [-2, 8, -12, 8, -2],
-                [2, -6, 8, -6, 2],
-                [-1, 2, -2, 2, -1],
-            ],
-            dtype=np.float32,
-        )
-        k2 = k2 / 12.0
-
-        # Kernel 3
-        k3 = np.array(
-            [
-                [0, 0, 0, 0, 0],
-                [0, 0, 0, 0, 0],
-                [0, 1, -2, 1, 0],
-                [0, 0, 0, 0, 0],
-                [0, 0, 0, 0, 0],
-            ],
-            dtype=np.float32,
-        )
-        k3 = k3 / 2.0
-
-        # Compute "Sum" Channel (mimicking the 5x5x3 convolution behavior)
-        sum_image = np.sum(image, axis=2, dtype=np.float32)
-
-        # Apply Filters
-        # depth=-1 means the output will have the same depth as the source (float32)
-        n1 = cv.filter2D(sum_image, -1, k1)
-        n2 = cv.filter2D(sum_image, -1, k2)
-        n3 = cv.filter2D(sum_image, -1, k3)
-
-        # FIX 2: Use stack to create the 3rd dimension.
-        # Result shape: (H, W, 3)
-        noise_image = np.stack([n1, n2, n3], axis=-1)
-
-        return noise_image
+        return image_rgb, mask
 
     def _validate_data(self):
         if len(self.images) != len(self.masks):
@@ -125,3 +87,49 @@ class SIMDataset(Dataset):
 
         if img_names != msk_names:
             raise ValueError("Image and mask filenames do not match.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Script to visualize each training image"
+    )
+    parser.add_argument("--index", type=int, required=True)
+    args = parser.parse_args()
+
+    image_dir = Path(
+        "/home/paschalis/code/SIMD/recodai-luc-scientific-image-forgery-detection/train_images/forged"
+    )
+    mask_dir = Path(
+        "/home/paschalis/code/SIMD/recodai-luc-scientific-image-forgery-detection/train_masks"
+    )
+
+    train_dataset = SIMDataset(image_dir=image_dir, mask_dir=mask_dir)
+
+    # 1. Get Data
+    image_rgb, mask = train_dataset[args.index]
+
+    # 2. Prepare RGB (Tensor -> Numpy, C,H,W -> H,W,C)
+    vis_rgb = image_rgb.permute(1, 2, 0).numpy()
+
+    # 3. Prepare Mask
+    vis_mask = mask.numpy()
+    vis_mask = vis_mask.transpose(1, 2, 0)
+
+    # Plot RGB
+    plt.subplot(1, 3, 1)
+    plt.imshow(vis_rgb)
+    plt.title("RGB Input")
+    plt.axis("off")
+
+    # Plot Mask Overlay
+    plt.subplot(1, 3, 2)
+    plt.imshow(vis_rgb)
+
+    # Single channel mask (H, W)
+    plt.imshow(vis_mask[:, :], cmap="jet", alpha=0.5)
+
+    plt.title("Ground Truth Mask")
+    plt.axis("off")
+
+    plt.tight_layout()
+    plt.show()
