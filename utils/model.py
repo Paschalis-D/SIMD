@@ -4,6 +4,7 @@ to apply only 3 SRM kernels to the RGB image so only 3 channels will be created.
 The model will then share a bottleneck and decoder.
 """
 
+from torch._numpy._dtypes import dtype
 import torch
 import numpy as np
 from torch import nn
@@ -89,7 +90,7 @@ class SRMConv2d(nn.Module):
             param.requires_grad = False
 
     def forward(self, x: torch.Tensor):
-        assert x.shape[0] == 3, f"Expected three image channels but got {x.shape[0]}"
+        assert x.shape[1] == 3, f"Expected 3 channels, got {x.shape[1]}"
         # x: (Batch, 3, H, W)
         noise = self.srm_layer(x)
 
@@ -167,7 +168,8 @@ class Decoder(nn.Module):
 
     def forward(self, x, skip_connections):
         # x: The bottleneck output from Encoder (e.g., 1024 channels, tiny H,W)
-        # skip_connections: List of features [64, 128, 256, 512, 1024]
+        # skip_connections: List of features [64, 128, 256, 512]
+        skip_connections = skip_connections[:-1]
 
         # We reverse the skips to match decoder direction
         # We assume the last element of skips is the same 'level' as x input if x was pooled
@@ -197,26 +199,50 @@ class Decoder(nn.Module):
 class SIMD(nn.Module):
     def __init__(self, depths: np.ndarray):
         super(SIMD, self).__init__()
-        self.depths = depths
-        self.encoder = Encoder(in_channels=3, depths=self.depths)
-        self.decoder = Decoder(depths=self.depths[::-1], num_classes=1)
+        self.encoder_depths = depths
+        self.decoder_depths = depths[::-1]
+
+        self.encoder = Encoder(in_channels=3, depths=self.encoder_depths)
+        self.decoder = Decoder(depths=self.decoder_depths, num_classes=1)
         self.srm_conv = SRMConv2d(truncation_threshold=3.0)
 
         # Define bottleneck channels
-        self.bn_ch = self.depths[-1]
+        self.in_bn_ch = (
+            2 * self.encoder_depths[-1]
+        )  # Due to the concatenation of the noise tensor
+        self.out_bn_ch = self.decoder_depths[0]
         self.bottleneck = ConvolutionBlock(
-            in_channels=self.bn_ch, out_channels=self.bn_ch
+            in_channels=self.in_bn_ch, out_channels=self.out_bn_ch
         )
 
-    def forward(self, rgb_tensor, noise_tensor):
-        rgb_enc, skip = self.encoder.forward(rgb_tensor)
+    def forward(self, rgb_tensor):
+        # 1. RGB Stream
+        rgb_enc, rgb_skips = self.encoder.forward(rgb_tensor)
 
-        # TODO: Apply here the SRM filter.
-        noise_enc, skip = self.encoder.forward(noise_tensor)
+        # 2. Noise Stream
+        noise_tensor = self.srm_conv.forward(rgb_tensor)
+        noise_enc, noise_skips = self.encoder.forward(noise_tensor)
 
-        # TODO: Concatenate the encoded rgb and noise tensors.
+        # 3. Fuse Skips
+        # This allows the decoder to see both RGB edges and Noise artifacts
+        fused_skips = [r + n for r, n in zip(rgb_skips, noise_skips)]
+
+        # 4. Bottleneck Fusion
+        encoded = torch.cat((rgb_enc, noise_enc), dim=1)
         bottleneck = self.bottleneck.forward(encoded)
 
-        out = self.decoder.forward(bottleneck, skip)
+        # 5. Decode with Fused Skips
+        out = self.decoder.forward(bottleneck, fused_skips)
 
         return out
+
+
+if __name__ == "__main__":
+    image_rgb = np.random.rand(2, 3, 512, 512)
+    image_rgb = torch.from_numpy(image_rgb).float()
+
+    model = SIMD(depths=[64, 128, 256, 512, 1024])
+
+    prediction = model.forward(image_rgb)
+
+    print(prediction.shape)
