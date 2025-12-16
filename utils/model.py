@@ -104,15 +104,15 @@ class SRMConv2d(nn.Module):
 
 
 class ConvolutionBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, use_activation: bool = True):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=True) if use_activation else nn.Identity(),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=True) if use_activation else nn.Identity(),
         )
 
     def forward(self, x):
@@ -161,7 +161,9 @@ class Decoder(nn.Module):
             )
 
             # Input channels = low_ch (from upsample) + low_ch (from skip connection)
-            self.dec_blocks.append(ConvolutionBlock(low_ch * 2, low_ch))
+            self.dec_blocks.append(
+                ConvolutionBlock(low_ch * 2, low_ch, use_activation=False)
+            )
 
         # Final classification layer (64 -> 1 for binary mask)
         self.final_conv = nn.Conv2d(depths[-1], num_classes, kernel_size=1)
@@ -202,37 +204,40 @@ class SIMD(nn.Module):
         self.encoder_depths = depths
         self.decoder_depths = depths[::-1]
 
-        self.encoder = Encoder(in_channels=3, depths=self.encoder_depths)
+        # FIX: Instantiate TWO separate encoders
+        # One specializes in visual content, the other in noise artifacts
+        self.rgb_encoder = Encoder(in_channels=3, depths=self.encoder_depths)
+        self.noise_encoder = Encoder(in_channels=3, depths=self.encoder_depths)
+
         self.decoder = Decoder(depths=self.decoder_depths, num_classes=1)
         self.srm_conv = SRMConv2d(truncation_threshold=3.0)
 
-        # Define bottleneck channels
-        self.in_bn_ch = (
-            2 * self.encoder_depths[-1]
-        )  # Due to the concatenation of the noise tensor
+        # Bottleneck: Concatenates the deepest features from BOTH encoders
+        self.in_bn_ch = 2 * self.encoder_depths[-1]
         self.out_bn_ch = self.decoder_depths[0]
         self.bottleneck = ConvolutionBlock(
             in_channels=self.in_bn_ch, out_channels=self.out_bn_ch
         )
 
     def forward(self, rgb_tensor):
-        # 1. RGB Stream
-        rgb_enc, rgb_skips = self.encoder.forward(rgb_tensor)
+        # 1. RGB Stream (Uses rgb_encoder)
+        rgb_enc, rgb_skips = self.rgb_encoder(rgb_tensor)
 
-        # 2. Noise Stream
-        noise_tensor = self.srm_conv.forward(rgb_tensor)
-        noise_enc, noise_skips = self.encoder.forward(noise_tensor)
+        # 2. Noise Stream (Uses noise_encoder)
+        noise_tensor = self.srm_conv(rgb_tensor)
+        noise_enc, noise_skips = self.noise_encoder(noise_tensor)
 
         # 3. Fuse Skips
-        # This allows the decoder to see both RGB edges and Noise artifacts
+        # We add them element-wise. This is valid because they have the same shape.
+        # This fuses semantic edges (RGB) with noise discrepancies (SRM).
         fused_skips = [r + n for r, n in zip(rgb_skips, noise_skips)]
 
         # 4. Bottleneck Fusion
         encoded = torch.cat((rgb_enc, noise_enc), dim=1)
-        bottleneck = self.bottleneck.forward(encoded)
+        bottleneck = self.bottleneck(encoded)
 
-        # 5. Decode with Fused Skips
-        out = self.decoder.forward(bottleneck, fused_skips)
+        # 5. Decode
+        out = self.decoder(bottleneck, fused_skips)
 
         return out
 
